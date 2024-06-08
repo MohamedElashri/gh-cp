@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -e
+
+usage() {
+  echo "Usage: gh cp [OPTIONS] <repo> <paths>... <dest>"
+  echo
+  echo "Copy files from a GitHub repository to a local destination."
+  echo
+  echo "Options:"
+  echo "  -h, --help           Show this help message and exit"
+  echo "  -f, --file           Read file paths from a file (one path per line)"
+  echo "  -b, --branch <name>  Specify the branch to copy files from (default: main)"
+  echo "  -c, --commit <hash>  Specify the commit hash to copy files from"
+  echo
+  echo "Arguments:"
+  echo "  <repo>        The repository in the format 'owner/repo'"
+  echo "  <paths>...    The paths to the files in the repository (separated by space)"
+  echo "  <dest>        The local destination directory"
+  echo
+  echo "Examples:"
+  echo "  gh cp myuser/myrepo path/to/file1.txt path/to/file2.txt /local/directory"
+  echo "  gh cp -f myuser/myrepo path_file.txt /local/directory"
+  echo "  gh cp -b feature-branch myuser/myrepo path/to/file.txt /local/directory"
+  echo "  gh cp -c a1b2c3d4 myuser/myrepo path/to/file.txt /local/directory"
+}
+
+# Parse command-line options
+branch="main"
+commit=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -f|--file)
+      path_file="$2"
+      shift 2
+      ;;
+    -b|--branch)
+      branch="$2"
+      shift 2
+      ;;
+    -c|--commit)
+      commit="$2"
+      shift 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ $# -lt 2 ]; then
+  echo "Error: Missing required arguments."
+  echo "Please provide the repository, file path(s), and destination directory."
+  echo "Run 'gh cp --help' for more information."
+  exit 1
+fi
+
+repo="$1"
+dest="${@: -1}"
+paths=("${@:2:$#-2}")
+
+# Check if the repository exists
+repo_exists=$(gh api "repos/$repo" >/dev/null 2>&1; echo $?)
+if [ "$repo_exists" -ne 0 ]; then
+  echo "Error: Repository '$repo' does not exist or is not accessible."
+  echo "Please ensure that the repository is specified in the format 'owner/repo' and that you have the necessary permissions."
+  exit 1
+fi
+
+# Read paths from file if provided
+if [ -n "$path_file" ]; then
+  if [ ! -f "$path_file" ]; then
+    echo "Error: File '$path_file' not found."
+    echo "Please provide a valid file containing the file paths (one path per line)."
+    exit 1
+  fi
+  readarray -t paths < "$path_file"
+fi
+
+# Validate the destination directory
+if [ ! -d "$dest" ]; then
+  echo "Error: Destination directory '$dest' does not exist."
+  echo "Please provide a valid destination directory path."
+  exit 1
+fi
+
+progress-bar() {
+  local total_size=$1
+
+  already_done() { for ((done=0; done<$elapsed; done++)); do printf "▇"; done }
+  remaining() { for ((remain=$elapsed; remain<$total_size; remain++)); do printf " "; done }
+  percentage() { printf "| %s%%" $(( (($elapsed)*100)/($total_size)*100/100 )); }
+  clean_line() { printf "\r"; }
+
+  trap 'clean_line' SIGINT SIGTERM
+
+  elapsed=0
+  while true; do
+    read -r chunk
+    elapsed=$((elapsed + ${#chunk}))
+    already_done; remaining; percentage
+    clean_line
+    if [ $elapsed -ge $total_size ]; then
+      break
+    fi
+  done
+  clean_line
+}
+
+# Determine the reference (branch or commit) to use
+ref=""
+if [ -n "$commit" ]; then
+  ref="commits/$commit"
+elif [ -n "$branch" ]; then
+  ref="branches/$branch"
+fi
+
+for path in "${paths[@]}"; do
+  # Validate the provided path
+  if [[ "$path" != */* ]]; then
+    echo "Error: Invalid path '$path' for repository '$repo'."
+    echo "The path should include at least one directory and be specified relative to the repository root."
+    continue
+  fi
+
+  dest_file="$dest/$(basename "$path")"
+  dest_dir="$(dirname "$dest_file")"
+  mkdir -p "$dest_dir"
+
+  # Download the file from the repository with progress bar
+  echo "Downloading file '$path' from repository '$repo' ($ref)..."
+  total_size=$(gh api -H "Accept: application/vnd.github.v3.raw" "repos/$repo/contents/$path?ref=$ref" -I | awk '/Content-Length/ {print $2}')
+
+  gh api -H 'accept: application/vnd.github.v3.raw' "repos/$repo/contents/$path?ref=$ref" |
+    tee "$dest_file" |
+    progress-bar $total_size
+
+  if [ ${PIPESTATUS[0]} -ne 0 ]; then
+    echo "Error: Failed to download file '$path' from repository '$repo' ($ref)."
+    echo "Please ensure that the file path is correct, the specified branch or commit exists, and that you have the necessary permissions to access the file."
+    continue
+  fi
+
+  echo "File '$path' successfully copied from repository '$repo' ($ref) to '$dest_file'."
+done
